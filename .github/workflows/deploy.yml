@@ -150,7 +150,14 @@ jobs:
           echo "Resolved SAM bucket: $BUCKET"
 
       - name: Build layer (SAM + Docker, ~10 min)
-        run: npm run build
+        # `npm run build` is `sam build`, but the layer's Makefile uses `dnf`
+        # (Amazon Linux package manager) for the C dep install — that doesn't
+        # exist on the Ubuntu GHA runner. `--use-container` runs the build
+        # inside `public.ecr.aws/sam/build-nodejs24.x:latest-x86_64` (Amazon
+        # Linux 2), which is what upstream's CodeBuild path implicitly does.
+        # We invoke sam directly here rather than changing package.json so the
+        # upstream npm scripts stay compatible.
+        run: sam build --use-container
 
       - name: Deploy layer
         env:
