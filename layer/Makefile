@@ -47,8 +47,14 @@ libwebp:
 
 libde265:
 	# libde265
+	# The 1.0.16 release tarball ships aclocal.m4 generated with libtool 2.4.6.
+	# Modern build containers (AL2023, used by SAM nodejs24 builds) ship libtool
+	# 2.4.7, which refuses to operate on the old definitions ("Version mismatch
+	# error"). The tarball's own autogen.sh calls `autoreconf -i` (install only,
+	# does not force-replace existing files), so aclocal.m4 stays at 2.4.6.
+	# `autoreconf -fi` forces regeneration from the system's libtool, fixing it.
 	curl -L https://github.com/strukturag/libde265/releases/download/v$(LIBDE265_VERSION)/libde265-$(LIBDE265_VERSION).tar.gz | tar zx
-	cd libde265-$(LIBDE265_VERSION) && ./autogen.sh && ./configure --disable-dec265 --disable-sherlock265 --prefix=$(PREFIX_PATH) && make V=0 && make install
+	cd libde265-$(LIBDE265_VERSION) && autoreconf -fi && ./configure --disable-dec265 --disable-sherlock265 --prefix=$(PREFIX_PATH) && make V=0 && make install
 
 x265:
 	# x265
