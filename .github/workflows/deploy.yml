@@ -10,14 +10,16 @@ name: Deploy sharp-heic Lambda Layer
 # The job runs `environment: layer-deploy-<stage>` so the OIDC `sub` claim
 # matches the role trust.
 #
-# The Liftlock org enforces `allowed_actions: local_only`. This workflow is
-# shell-only by design — no `uses:` lines for marketplace actions, mirroring
-# the pattern in `RewardsIAC/.github/workflows/cdk-deploy.yml` and
-# `RewardsNext/.github/workflows/bg-deploy.yml`.
+# Runs on the self-hosted macOS ARM64 runner that also serves Liftlock/
+# RewardsNext's CI (see `.github/workflows/test.yml` over there). The mac
+# is materially faster than GHA-hosted ubuntu-latest for this build, and
+# we already pay for it. The build still produces a Linux x86_64 binary
+# via SAM's --use-container path, which runs the build inside the
+# `public.ecr.aws/sam/build-nodejs24.x:latest-x86_64` Docker container
+# under Apple's x86_64 emulation.
 #
-# The layer build itself is the slow step: ~10 min compiling libwebp +
-# libde265 + libaom + x265 + libheif + libvips, then npm-installing sharp
-# from source against the freshly-compiled libvips. Set timeout accordingly.
+# The Liftlock org enforces `allowed_actions: local_only`. This workflow is
+# shell-only by design — no `uses:` lines for marketplace actions.
 
 on:
   push:
@@ -45,7 +47,7 @@ permissions:
 jobs:
   deploy:
     name: deploy-layer
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64]
     timeout-minutes: 30
     # IMPORTANT: this `environment:` value is load-bearing. The OIDC
     # token's `sub` claim becomes `repo:<owner>/<repo>:environment:<env>`
@@ -55,17 +57,23 @@ jobs:
     environment: layer-deploy-${{ github.event.inputs.stage || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
 
     steps:
-      - name: Checkout
+      # Self-hosted runners persist files between jobs — wipe the workspace
+      # before each run so we start from a clean clone. Mirrors the pattern
+      # in Liftlock/RewardsNext .github/workflows/test.yml.
+      - name: Prepare workspace
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          git init .
-          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.sha }}"
-          git checkout --force FETCH_HEAD
+          cd "$GITHUB_WORKSPACE"
+          rm -rf .* * 2>/dev/null || true
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" .
+          git fetch origin
+          git checkout -f "${{ github.sha }}"
 
       - name: Resolve stage
         id: stage
+        shell: bash
         run: |
           if [ -n "${{ github.event.inputs.stage }}" ]; then
             STAGE="${{ github.event.inputs.stage }}"
@@ -93,28 +101,69 @@ jobs:
           fi
           echo "Resolved stage: $STAGE (account $(grep '^account=' "$GITHUB_OUTPUT" | cut -d= -f2))"
 
-      - name: Tool versions
+      # The self-hosted mac runner has Docker (Desktop or colima), Node via
+      # nvm, and AWS CLI preinstalled (test.yml relies on the same baseline).
+      # SAM CLI is installed via Homebrew if not present. Docker is required
+      # for the `sam build --use-container` step which compiles libheif /
+      # libvips / libaom / sharp inside the Amazon Linux 2023 build image.
+      - name: Setup tools (Node via nvm, SAM via brew, verify Docker)
+        shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
         run: |
-          node --version
-          npm --version
-          aws --version
+          set -e
+
+          # Node 24 via nvm — sam build's --use-container path doesn't need
+          # node locally for the build, but `npm ci` does (for the lint step
+          # and SAM's bundling helpers).
+          export NVM_DIR="$HOME/.nvm"
+          NVM_SH="$(brew --prefix nvm)/nvm.sh"
+          if [ ! -f "$NVM_SH" ]; then
+            brew install nvm
+            mkdir -p "$NVM_DIR"
+          fi
+          source "$NVM_SH"
+          nvm install 24
+          nvm use 24
+
+          # SAM CLI via Homebrew tap. Tap is idempotent.
+          if ! command -v sam >/dev/null 2>&1; then
+            brew install aws/tap/aws-sam-cli
+          fi
+
+          # Verify Docker is running. We don't start it here — Docker Desktop
+          # / colima should already be running on the self-hosted runner.
+          if ! docker info >/dev/null 2>&1; then
+            echo "Docker daemon is not running on this runner. Start Docker Desktop or colima before re-running." >&2
+            exit 1
+          fi
+
+          echo "node: $(node --version)"
+          echo "npm:  $(npm --version)"
+          echo "sam:  $(sam --version)"
+          echo "aws:  $(aws --version)"
           docker --version
 
-      - name: Install SAM CLI
+      - name: Install fork deps (corepack pnpm)
+        shell: bash
         run: |
-          python3 -m pip install --quiet --user aws-sam-cli
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: SAM version
-        run: sam --version
-
-      - name: Install fork deps
-        run: npm ci
+          export NVM_DIR="$HOME/.nvm"
+          source "$(brew --prefix nvm)/nvm.sh"
+          nvm use 24
+          # The fork uses npm, not pnpm — package-lock.json. Plain npm ci.
+          npm ci
 
       - name: Lint
-        run: npm run lint
+        shell: bash
+        run: |
+          export NVM_DIR="$HOME/.nvm"
+          source "$(brew --prefix nvm)/nvm.sh"
+          nvm use 24
+          npm run lint
 
       - name: Configure AWS credentials (OIDC)
+        shell: bash
         env:
           ROLE_ARN: arn:aws:iam::${{ steps.stage.outputs.account }}:role/rewards-layer-github-actions-${{ steps.stage.outputs.stage }}
           ROLE_SESSION_NAME: rewards-layer-${{ steps.stage.outputs.stage }}-${{ github.run_id }}
@@ -139,8 +188,11 @@ jobs:
             echo "AWS_REGION=ca-central-1"
             echo "AWS_DEFAULT_REGION=ca-central-1"
           } >> "$GITHUB_ENV"
+          # Also clean up the temp file with credentials.
+          rm -f /tmp/aws-credentials.json
 
       - name: Resolve SAM artifacts bucket from SSM
+        shell: bash
         run: |
           BUCKET="$(aws ssm get-parameter \
             --name "/rewards/${{ steps.stage.outputs.stage }}/sam/artifacts-bucket-name" \
@@ -149,26 +201,33 @@ jobs:
           echo "SAM_BUCKET=$BUCKET" >> "$GITHUB_ENV"
           echo "Resolved SAM bucket: $BUCKET"
 
-      - name: Build layer (SAM + Docker, ~10 min)
-        # `npm run build` is `sam build`, but the layer's Makefile uses `dnf`
-        # (Amazon Linux package manager) for the C dep install — that doesn't
-        # exist on the Ubuntu GHA runner. `--use-container` runs the build
-        # inside `public.ecr.aws/sam/build-nodejs24.x:latest-x86_64` (Amazon
-        # Linux 2), which is what upstream's CodeBuild path implicitly does.
-        # We invoke sam directly here rather than changing package.json so the
-        # upstream npm scripts stay compatible.
-        run: sam build --use-container
+      - name: Build layer (SAM + Docker x86_64 emulation)
+        shell: bash
+        run: |
+          export NVM_DIR="$HOME/.nvm"
+          source "$(brew --prefix nvm)/nvm.sh"
+          nvm use 24
+          # --use-container runs the build inside an Amazon Linux 2023 image
+          # so the Makefile's `dnf` install + autoreconf step finds the
+          # expected toolchain. The image is x86_64; on Apple Silicon Docker
+          # runs it via emulation. The resulting Layer binary is Linux x86_64,
+          # matching the imageTransform function's `architecture: x86_64`.
+          sam build --use-container
 
       - name: Deploy layer
+        shell: bash
         env:
-          # Per-account naming (no stage suffix): dev and prod live in
-          # different AWS accounts, and Lambda layer ARNs are account-scoped.
           STACK_NAME: sharp-heic-lambda-layer
           LAYER_NAME: sharp-heic
           S3_PREFIX: sharp-heic-lambda-layer
-        run: npm run deploy
+        run: |
+          export NVM_DIR="$HOME/.nvm"
+          source "$(brew --prefix nvm)/nvm.sh"
+          nvm use 24
+          npm run deploy
 
       - name: Publish layer ARN to SSM
+        shell: bash
         run: |
           ARN="$(aws cloudformation describe-stacks \
             --stack-name sharp-heic-lambda-layer \
