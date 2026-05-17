@@ -1,0 +1,179 @@
+name: Deploy sharp-heic Lambda Layer
+
+# One workflow for both dev and prod. Stage is derived from the branch:
+#   dev branch  → dev (account 122610504511)
+#   main branch → prod (account 135808932525)
+#
+# GitHub assumes a per-stage AWS role via OIDC. The role lives in
+# `Liftlock/RewardsIAC` as `rewards-layer-github-actions-<stage>` and
+# trusts `repo:Liftlock/sharp-heic-lambda-layer:environment:layer-deploy-<stage>`.
+# The job runs `environment: layer-deploy-<stage>` so the OIDC `sub` claim
+# matches the role trust.
+#
+# The Liftlock org enforces `allowed_actions: local_only`. This workflow is
+# shell-only by design — no `uses:` lines for marketplace actions, mirroring
+# the pattern in `RewardsIAC/.github/workflows/cdk-deploy.yml` and
+# `RewardsNext/.github/workflows/bg-deploy.yml`.
+#
+# The layer build itself is the slow step: ~10 min compiling libwebp +
+# libde265 + libaom + x265 + libheif + libvips, then npm-installing sharp
+# from source against the freshly-compiled libvips. Set timeout accordingly.
+
+on:
+  push:
+    branches: [dev, main]
+    paths-ignore:
+      - '**/*.md'
+      - '.gitignore'
+      - '.github/FUNDING.yml'
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: 'Stage to deploy'
+        required: true
+        type: choice
+        options: [dev, prod]
+
+concurrency:
+  group: layer-deploy-${{ github.event.inputs.stage || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: deploy-layer
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # IMPORTANT: this `environment:` value is load-bearing. The OIDC
+    # token's `sub` claim becomes `repo:<owner>/<repo>:environment:<env>`
+    # only when `environment:` is set. The layer-deploy role's trust
+    # policy matches that exact form. Without this line the sts:
+    # AssumeRoleWithWebIdentity call fails with no actionable error.
+    environment: layer-deploy-${{ github.event.inputs.stage || (github.ref == 'refs/heads/main' && 'prod' || 'dev') }}
+
+    steps:
+      - name: Checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.sha }}"
+          git checkout --force FETCH_HEAD
+
+      - name: Resolve stage
+        id: stage
+        run: |
+          if [ -n "${{ github.event.inputs.stage }}" ]; then
+            STAGE="${{ github.event.inputs.stage }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            STAGE="prod"
+          else
+            STAGE="dev"
+          fi
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          if [ "$STAGE" = "prod" ]; then
+            echo "account=135808932525" >> "$GITHUB_OUTPUT"
+          else
+            echo "account=122610504511" >> "$GITHUB_OUTPUT"
+          fi
+          # Manual-dispatch safety: prod manual deploys only from main, dev only from dev.
+          if [ -n "${{ github.event.inputs.stage }}" ]; then
+            if [ "$STAGE" = "prod" ] && [ "${{ github.ref }}" != "refs/heads/main" ]; then
+              echo "Manual prod deploys must be run from the main branch." >&2
+              exit 1
+            fi
+            if [ "$STAGE" = "dev" ] && [ "${{ github.ref }}" != "refs/heads/dev" ]; then
+              echo "Manual dev deploys must be run from the dev branch." >&2
+              exit 1
+            fi
+          fi
+          echo "Resolved stage: $STAGE (account $(grep '^account=' "$GITHUB_OUTPUT" | cut -d= -f2))"
+
+      - name: Tool versions
+        run: |
+          node --version
+          npm --version
+          aws --version
+          docker --version
+
+      - name: Install SAM CLI
+        run: |
+          python3 -m pip install --quiet --user aws-sam-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: SAM version
+        run: sam --version
+
+      - name: Install fork deps
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Configure AWS credentials (OIDC)
+        env:
+          ROLE_ARN: arn:aws:iam::${{ steps.stage.outputs.account }}:role/rewards-layer-github-actions-${{ steps.stage.outputs.stage }}
+          ROLE_SESSION_NAME: rewards-layer-${{ steps.stage.outputs.stage }}-${{ github.run_id }}
+        run: |
+          OIDC_RESPONSE="$(curl -sS -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")"
+          OIDC_TOKEN="$(node -e "const fs = require('fs'); process.stdout.write(JSON.parse(fs.readFileSync(0, 'utf8')).value)" <<< "$OIDC_RESPONSE")"
+          aws sts assume-role-with-web-identity \
+            --role-arn "$ROLE_ARN" \
+            --role-session-name "$ROLE_SESSION_NAME" \
+            --web-identity-token "$OIDC_TOKEN" \
+            --duration-seconds 3600 > /tmp/aws-credentials.json
+          AWS_ACCESS_KEY_ID="$(node -e 'const fs = require("fs"); process.stdout.write(JSON.parse(fs.readFileSync("/tmp/aws-credentials.json", "utf8")).Credentials.AccessKeyId)')"
+          AWS_SECRET_ACCESS_KEY="$(node -e 'const fs = require("fs"); process.stdout.write(JSON.parse(fs.readFileSync("/tmp/aws-credentials.json", "utf8")).Credentials.SecretAccessKey)')"
+          AWS_SESSION_TOKEN="$(node -e 'const fs = require("fs"); process.stdout.write(JSON.parse(fs.readFileSync("/tmp/aws-credentials.json", "utf8")).Credentials.SessionToken)')"
+          echo "::add-mask::$AWS_ACCESS_KEY_ID"
+          echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+          echo "::add-mask::$AWS_SESSION_TOKEN"
+          {
+            echo "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID"
+            echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY"
+            echo "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN"
+            echo "AWS_REGION=ca-central-1"
+            echo "AWS_DEFAULT_REGION=ca-central-1"
+          } >> "$GITHUB_ENV"
+
+      - name: Resolve SAM artifacts bucket from SSM
+        run: |
+          BUCKET="$(aws ssm get-parameter \
+            --name "/rewards/${{ steps.stage.outputs.stage }}/sam/artifacts-bucket-name" \
+            --query 'Parameter.Value' \
+            --output text)"
+          echo "SAM_BUCKET=$BUCKET" >> "$GITHUB_ENV"
+          echo "Resolved SAM bucket: $BUCKET"
+
+      - name: Build layer (SAM + Docker, ~10 min)
+        run: npm run build
+
+      - name: Deploy layer
+        env:
+          # Per-account naming (no stage suffix): dev and prod live in
+          # different AWS accounts, and Lambda layer ARNs are account-scoped.
+          STACK_NAME: sharp-heic-lambda-layer
+          LAYER_NAME: sharp-heic
+          S3_PREFIX: sharp-heic-lambda-layer
+        run: npm run deploy
+
+      - name: Publish layer ARN to SSM
+        run: |
+          ARN="$(aws cloudformation describe-stacks \
+            --stack-name sharp-heic-lambda-layer \
+            --query "Stacks[0].Outputs[?OutputKey=='SharpHEICLayerArn'].OutputValue" \
+            --output text)"
+          if [ -z "$ARN" ] || [ "$ARN" = "None" ]; then
+            echo "Could not resolve SharpHEICLayerArn from CFN outputs" >&2
+            exit 1
+          fi
+          aws ssm put-parameter \
+            --name "/rewards/${{ steps.stage.outputs.stage }}/lambda-layers/sharp-heic-arn" \
+            --value "$ARN" \
+            --type String \
+            --overwrite
+          echo "Published layer ARN to SSM: $ARN"

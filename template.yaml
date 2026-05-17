@@ -54,5 +54,8 @@ Outputs:
   SharpHEICLayerArn:
     Value: !Ref SharpHEICLayer
     Description: ARN of the Sharp HEIC Lambda Layer
-    Export:
-      Name: SharpHEICLayerArn
+    # No CFN Export here. The Liftlock fork integrates this layer with
+    # downstream consumers (RewardsNext bg-jobs Lambda) via SSM, not via
+    # CFN's global-namespace Export. The deploy workflow reads this
+    # Output via `aws cloudformation describe-stacks` and publishes it
+    # to `/rewards/<stage>/lambda-layers/sharp-heic-arn`.
